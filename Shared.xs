@@ -10,7 +10,8 @@
     if (!sv_isobject(sv) || !sv_derived_from(sv, "Data::KDTree::Shared")) \
         croak("Expected a Data::KDTree::Shared object"); \
     KdHandle *h = INT2PTR(KdHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Attempted to use a destroyed Data::KDTree::Shared object")
+    if (!h) croak("Attempted to use a destroyed Data::KDTree::Shared object"); \
+    sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -35,6 +36,7 @@ static void kd_query_unlock(KdHandle *h, int wr) {
 
 /* read an arrayref of exactly dims finite coordinates into buf (croaks on error) */
 static void kd_read_point(pTHX_ KdHandle *h, SV *aref, double *buf, const char *what) {
+    SvGETMAGIC(aref);   /* a tied/overloaded container FETCHes its arrayref here */
     if (!SvROK(aref) || SvTYPE(SvRV(aref)) != SVt_PVAV)
         croak("Data::KDTree::Shared->%s: expected an array reference of %u coordinates", what, (unsigned)h->dims);
     AV *av = (AV *)SvRV(aref);
@@ -69,12 +71,14 @@ new(class, path = &PL_sv_undef, dims = 2, capacity = 0, ...)
   PREINIT:
     char errbuf[KD_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (capacity < 1)
         croak("Data::KDTree::Shared->new: capacity must be >= 1");
     /* Optional 5th arg: file mode for a newly-created file-backed segment
      * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing. */
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
+    /* Capture the path PV only after every trailing arg is resolved: the
+     * get-magic above can run Perl code that reallocs/frees path's PV. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     KdHandle *h = kd_create(p, (uint64_t)dims, (uint64_t)capacity, mode, errbuf);
     if (!h) croak("Data::KDTree::Shared->new: %s", errbuf);
     MAKE_OBJ(class, h);

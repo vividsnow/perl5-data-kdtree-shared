@@ -10,3 +10,4 @@
 /ppport.h
 *.tar.gz
 /Data-KDTree-Shared-*/
+_Inline/
