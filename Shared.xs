@@ -13,6 +13,19 @@
     if (!h) croak("Attempted to use a destroyed Data::KDTree::Shared object"); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
+/* Re-read the handle after a call that can run Perl code. EXTRACT's
+ * sv_2mortal(SvREFCNT_inc(...)) pin only blocks REFCOUNT-driven destruction;
+ * an explicit $obj->DESTROY frees the handle regardless and zeroes the IV.
+ * Magic reaches us through kd_read_point: SvGETMAGIC on the arrayref, av_len
+ * on a TIED array (AvFILL -> mg_size -> FETCHSIZE), and SvNV on each element.
+ * The same Perl can also REPLACE the invocant ($obj = 42 mutates ST(0),
+ * because Perl passes aliases), hence the SvROK re-check before SvRV. */
+#define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::KDTree::Shared object was replaced during the call"); \
+    h = INT2PTR(KdHandle*, SvIV(SvRV(sv))); \
+    if (!h) croak("Data::KDTree::Shared object destroyed during the call")
+
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
     SV *ref = newRV_noinc(obj); \
@@ -35,14 +48,21 @@ static void kd_query_unlock(KdHandle *h, int wr) {
 }
 
 /* read an arrayref of exactly dims finite coordinates into buf (croaks on error) */
+/* `dims` is immutable geometry, so it is snapshotted ONCE up front rather than
+ * re-read from the handle after each magic-capable step: the arrayref's
+ * get-magic, a tied array's FETCHSIZE, and every element's SvNV can all run
+ * Perl that destroys the object. The caller re-reads its own handle after this
+ * returns (see REEXTRACT at each call site) -- `h` here is by value, so a
+ * re-read inside this function would not reach the caller's copy. */
 static void kd_read_point(pTHX_ KdHandle *h, SV *aref, double *buf, const char *what) {
+    uint32_t dims = h->dims;
     SvGETMAGIC(aref);   /* a tied/overloaded container FETCHes its arrayref here */
     if (!SvROK(aref) || SvTYPE(SvRV(aref)) != SVt_PVAV)
-        croak("Data::KDTree::Shared->%s: expected an array reference of %u coordinates", what, (unsigned)h->dims);
+        croak("Data::KDTree::Shared->%s: expected an array reference of %u coordinates", what, (unsigned)dims);
     AV *av = (AV *)SvRV(aref);
-    if (av_len(av) + 1 != (IV)h->dims)
-        croak("Data::KDTree::Shared->%s: expected %u coordinates, got %ld", what, (unsigned)h->dims, (long)(av_len(av) + 1));
-    for (uint32_t d = 0; d < h->dims; d++) {
+    if (av_len(av) + 1 != (IV)dims)
+        croak("Data::KDTree::Shared->%s: expected %u coordinates, got %ld", what, (unsigned)dims, (long)(av_len(av) + 1));
+    for (uint32_t d = 0; d < dims; d++) {
         SV **el = av_fetch(av, (SSize_t)d, 0);
         double v = (el && *el) ? SvNV(*el) : 0.0;
         if (!isfinite(v)) croak("Data::KDTree::Shared->%s: coordinate %u is not finite", what, (unsigned)d);
@@ -137,11 +157,13 @@ add(self, coords, id = &PL_sv_undef)
     uint64_t payload;
   CODE:
     kd_read_point(aTHX_ h, coords, buf, "add");     /* may croak -- BEFORE the lock */
+    REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     /* Resolve the id BEFORE locking: SvUV on a tied/overloaded SV can run Perl
      * code that dies, and a longjmp past the wrlock would strand it on a live
      * PID (dead-owner recovery never fires) -- a permanent shared-segment deadlock. */
     int have_id = (SvGETMAGIC(id), SvOK(id));
     uint64_t id_val = have_id ? (uint64_t)SvUV(id) : 0;
+    REEXTRACT(self);   /* the id's get-magic is a second window */
     kd_rwlock_wrlock(h);
     payload = have_id ? id_val : h->hdr->count;     /* default id = insertion index */
     slot = kd_add_locked(h, buf, payload);
@@ -173,6 +195,7 @@ nearest(self, coords)
     uint64_t found;
   CODE:
     kd_read_point(aTHX_ h, coords, buf, "nearest");
+    REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     {
         int wr = kd_query_lock(h);
         found = kd_knn_locked(h, buf, 1, &best);
@@ -199,6 +222,7 @@ knn(self, coords, m)
     double buf[KD_MAX_DIMS];
   PPCODE:
     kd_read_point(aTHX_ h, coords, buf, "knn");
+    REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     {
         KdRes *res = NULL;
         uint64_t got = 0, i;
@@ -230,6 +254,7 @@ range(self, lo, hi)
   PPCODE:
     kd_read_point(aTHX_ h, lo, blo, "range");
     kd_read_point(aTHX_ h, hi, bhi, "range");
+    REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     {
         uint64_t *ids = NULL, got = 0, i, cap = h->capacity;
         if (cap) { Newx(ids, (size_t)cap, uint64_t); SAVEFREEPV(ids); }   /* alloc BEFORE the lock */
@@ -253,6 +278,7 @@ radius(self, coords, r)
   PPCODE:
     if (r < 0) croak("Data::KDTree::Shared->radius: radius must be >= 0");
     kd_read_point(aTHX_ h, coords, buf, "radius");
+    REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     {
         KdRes *res = NULL;
         uint64_t got = 0, i, cap = h->capacity;
