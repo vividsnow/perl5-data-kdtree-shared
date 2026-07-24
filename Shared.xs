@@ -253,6 +253,7 @@ range(self, lo, hi)
     double blo[KD_MAX_DIMS], bhi[KD_MAX_DIMS];
   PPCODE:
     kd_read_point(aTHX_ h, lo, blo, "range");
+    REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     kd_read_point(aTHX_ h, hi, bhi, "range");
     REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     {

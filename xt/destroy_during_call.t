@@ -28,11 +28,22 @@ use Data::KDTree::Shared;
 plan skip_all => 'fork required' unless $Config{d_fork};
 
 our $victim;
+our $groom;   # keeps the realloc tree alive so its handle is not re-freed
 
 # tied array whose FETCHSIZE (reached via av_len) destroys the tree
 {   package Tied::Destroy;
     sub TIEARRAY  { bless { obj => $_[1] }, $_[0] }
     sub FETCHSIZE { $_[0]{obj}->DESTROY; 2 }
+    sub FETCH     { 1.0 }
+}
+# tied array whose FETCHSIZE destroys the tree AND grooms the freed handle:
+# a fresh dims=3 tree calloc's the same-sized KdHandle chunk (tcache LIFO), so a
+# stale h->dims read sees 3 and kd_read_point(hi) dies with the WRONG message --
+# only the intermediate REEXTRACT gives the specific "destroyed" croak.
+{   package Tied::Destroy::Realloc;
+    sub TIEARRAY  { bless { obj => $_[1] }, $_[0] }
+    sub FETCHSIZE { $_[0]{obj}->DESTROY;
+                    $main::groom = Data::KDTree::Shared->new(undef, 3, 16); 2 }
     sub FETCH     { 1.0 }
 }
 # tied array whose FETCHSIZE replaces the invocant instead
@@ -61,6 +72,8 @@ my @cases = (
       sub { tie my @c, 'Tied::Destroy', $victim; $victim->nearest(\@c) } ],
     [ 'knn: tied FETCHSIZE destroys', $destroyed,
       sub { tie my @c, 'Tied::Destroy', $victim; $victim->knn(\@c, 1) } ],
+    [ 'range: tied FETCHSIZE on lo destroys', $destroyed,
+      sub { tie my @c, 'Tied::Destroy::Realloc', $victim; $victim->range(\@c, [0.0, 0.0]) } ],
     [ 'radius: tied FETCHSIZE destroys', $destroyed,
       sub { tie my @c, 'Tied::Destroy', $victim; $victim->radius(\@c, 1.0) } ],
 );
