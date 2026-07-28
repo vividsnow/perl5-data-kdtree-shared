@@ -11,6 +11,7 @@
         croak("Expected a Data::KDTree::Shared object"); \
     KdHandle *h = INT2PTR(KdHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::KDTree::Shared object"); \
+    KdHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* Re-read the handle after a call that can run Perl code. EXTRACT's
@@ -24,7 +25,7 @@
     if (!SvROK(sv)) \
         croak("Data::KDTree::Shared object was replaced during the call"); \
     h = INT2PTR(KdHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::KDTree::Shared object destroyed during the call")
+    if (h != h0) croak("Data::KDTree::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -60,6 +61,7 @@ static void kd_read_point(pTHX_ KdHandle *h, SV *aref, double *buf, const char *
     if (!SvROK(aref) || SvTYPE(SvRV(aref)) != SVt_PVAV)
         croak("Data::KDTree::Shared->%s: expected an array reference of %u coordinates", what, (unsigned)dims);
     AV *av = (AV *)SvRV(aref);
+    sv_2mortal(SvREFCNT_inc((SV *)av));   /* pin the arrayref: element magic below cannot free it mid-loop */
     if (av_len(av) + 1 != (IV)dims)
         croak("Data::KDTree::Shared->%s: expected %u coordinates, got %ld", what, (unsigned)dims, (long)(av_len(av) + 1));
     for (uint32_t d = 0; d < dims; d++) {
