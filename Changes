@@ -1,5 +1,8 @@
 Revision history for Data-KDTree-Shared
 
 0.01      2026-07-22
+          - Add a frozen read-only mode: freeze() seals a file-backed k-d tree
+            immutable; new_readonly() opens it O_RDONLY / PROT_READ and queries
+            it lock-free.
           - Initial release.
 

@@ -67,13 +67,15 @@ C<capacity * 4> bytes and a fixed header.
     my $kd = Data::KDTree::Shared->new(undef, $dims, $capacity);
     my $kd = Data::KDTree::Shared->new_memfd($name, $dims, $capacity);
     my $kd = Data::KDTree::Shared->new_from_fd($fd);
+    my $kd = Data::KDTree::Shared->new_readonly($path);   # frozen file, lock-free
 
 C<$dims> is the number of dimensions (1..16) and C<$capacity> the maximum number
 of points (1..2^24). C<new> and C<new_memfd> croak on an out-of-range C<$dims> or
 C<$capacity>. When reopening an existing file or memfd the stored geometry wins
 and the caller's arguments are ignored. An optional file B<mode> may be passed as
 the last argument to C<new> (e.g. C<0660>) for cross-user sharing; it defaults to
-C<0600> (owner-only).
+C<0600> (owner-only). A read-write reopen of a B<frozen> file is refused; use
+C<new_readonly> instead (see L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Adding points
 
@@ -109,14 +111,57 @@ coordinates.
     $kd->capacity;      # maximum number of points
     $kd->dims;          # number of dimensions
     $kd->clear;         # remove all points
-    $kd->stats;         # { count, dims, capacity, dirty, ops, mmap_size }
+    $kd->stats;         # { count, dims, capacity, dirty, ops, mmap_size, frozen, readonly }
+    $kd->frozen;        # 1 if sealed by freeze, else 0
+    $kd->readonly;      # 1 if this handle is a read-only view, else 0
     $kd->path; $kd->memfd; $kd->sync; $kd->unlink;
 
 C<clear> empties the index. C<sync> flushes the mapping to its backing store (a
-no-op for anonymous and memfd trees); C<unlink> removes the backing file (also
-callable as C<< Class->unlink($path) >>); C<path> returns the backing path
-(C<undef> for anonymous, memfd, or fd-reopened trees) and C<memfd> the backing
-descriptor.
+no-op for anonymous and memfd trees, and for any read-only view); C<unlink>
+removes the backing file (also callable as C<< Class->unlink($path) >>);
+C<path> returns the backing path (C<undef> for anonymous, memfd, or fd-reopened
+trees) and C<memfd> the backing descriptor. C<frozen> and C<readonly> report
+whether the tree has been sealed and whether this handle is a read-only view,
+respectively (see L</"FROZEN (READ-ONLY) MODE">).
+
+=head1 FROZEN (READ-ONLY) MODE
+
+A file-backed tree can be B<frozen> and then shipped to other machines, where
+consumers open it B<read-only> and query it with B<no locking at all>.
+
+    # producer: build, freeze, ship the file
+    my $kd = Data::KDTree::Shared->new("/tmp/points.kd", 2, 100_000);
+    $kd->add([$_->[0], $_->[1]], $_->[2]) for @known;
+    $kd->freeze;                 # seal: now immutable, and $kd itself is read-only
+    # ... copy /tmp/points.kd to another host ...
+
+    # consumer (any process, same architecture): read-only, lock-free
+    my $ro = Data::KDTree::Shared->new_readonly("/tmp/points.kd");
+    my $n  = $ro->nearest([$x, $y]);   # or knn / range / radius
+
+C<freeze> takes the write lock, force-completes any balanced-tree build still
+pending (so a frozen tree is never left C<dirty>), marks the tree B<permanently
+immutable> (there is no unfreeze -- rebuild the file to change it), and flushes
+the seal to disk. A frozen tree rejects every mutator (C<add>, C<build>,
+C<clear>) with a croak, and a read-write reopen (C<< new($path, ...) >>) of a
+sealed file is B<refused> -- so a shipped artifact can never be silently mutated
+out from under its readers.
+
+C<new_readonly($path)> maps the file C<O_RDONLY> / C<PROT_READ> and B<requires it
+to be frozen> (it croaks on a file that was never C<freeze>d). Because C<freeze>
+guarantees the balanced tree is already built, and a sealed tree's points and
+links are immutable, C<nearest>, C<knn>, C<range>, C<radius>, C<count> and
+C<stats> read them B<directly, taking no reader lock and never rebuilding> --
+the mapping is never written, so a read-only view works from a read-only file
+descriptor or a read-only filesystem, and any number of processes can share one
+C<PROT_READ> mapping. C<frozen> and C<readonly> report the two states.
+
+B<Portability.> The on-disk format is native binary (native-endian 64-bit
+words), so a frozen file may be copied only between machines of the B<same
+architecture>; a wrong-endian file is rejected at open by the magic check.
+B<Copy the file to each consumer> -- do not share one file over a network
+filesystem: the lock is a Linux futex (process-local to one kernel), and the
+"no live writer" contract assumes a static copy. Linux-only; 64-bit Perl.
 
 =head1 SHARING ACROSS PROCESSES
 

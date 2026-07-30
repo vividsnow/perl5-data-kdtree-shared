@@ -138,6 +138,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[KD_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::KDTree::Shared->new_readonly: path is required");
+    KdHandle *h = kd_open_readonly(p, errbuf);
+    if (!h) croak("Data::KDTree::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read the class PV after path's get-magic (may realloc ST(0)) */
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -158,6 +176,7 @@ add(self, coords, id = &PL_sv_undef)
     int64_t slot;
     uint64_t payload;
   CODE:
+    if (h->readonly) croak("Data::KDTree::Shared->add: tree is frozen (read-only)");
     kd_read_point(aTHX_ h, coords, buf, "add");     /* may croak -- BEFORE the lock */
     REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
     /* Resolve the id BEFORE locking: SvUV on a tied/overloaded SV can run Perl
@@ -167,6 +186,7 @@ add(self, coords, id = &PL_sv_undef)
     uint64_t id_val = have_id ? (uint64_t)SvUV(id) : 0;
     REEXTRACT(self);   /* the id's get-magic is a second window */
     kd_rwlock_wrlock(h);
+    if (h->hdr->sealed) { kd_rwlock_wrunlock(h); croak("Data::KDTree::Shared->add: tree is frozen (read-only)"); }
     payload = have_id ? id_val : h->hdr->count;     /* default id = insertion index */
     slot = kd_add_locked(h, buf, payload);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -182,7 +202,9 @@ build(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::KDTree::Shared->build: tree is frozen (read-only)");
     kd_rwlock_wrlock(h);
+    if (h->hdr->sealed) { kd_rwlock_wrunlock(h); croak("Data::KDTree::Shared->build: tree is frozen (read-only)"); }
     if (h->hdr->dirty) kd_build_locked(h);
     kd_rwlock_wrunlock(h);
 
@@ -198,7 +220,9 @@ nearest(self, coords)
   CODE:
     kd_read_point(aTHX_ h, coords, buf, "nearest");
     REEXTRACT(self);   /* kd_read_point ran arbitrary Perl */
-    {
+    if (h->readonly) {   /* frozen: freeze() force-built the tree, so it is never dirty here -- lock-free, no build */
+        found = kd_knn_locked(h, buf, 1, &best);
+    } else {
         int wr = kd_query_lock(h);
         found = kd_knn_locked(h, buf, 1, &best);
         kd_query_unlock(h, wr);
@@ -230,7 +254,9 @@ knn(self, coords, m)
         uint64_t got = 0, i;
         if (m > h->capacity) m = h->capacity;   /* at most all points */
         if (m) { Newx(res, (size_t)m, KdRes); SAVEFREEPV(res); }   /* alloc BEFORE the lock */
-        {
+        if (h->readonly) {   /* frozen: never dirty -- lock-free, no build */
+            got = m ? kd_knn_locked(h, buf, m, res) : 0;
+        } else {
             int wr = kd_query_lock(h);
             got = m ? kd_knn_locked(h, buf, m, res) : 0;
             kd_query_unlock(h, wr);
@@ -261,7 +287,9 @@ range(self, lo, hi)
     {
         uint64_t *ids = NULL, got = 0, i, cap = h->capacity;
         if (cap) { Newx(ids, (size_t)cap, uint64_t); SAVEFREEPV(ids); }   /* alloc BEFORE the lock */
-        {
+        if (h->readonly) {   /* frozen: never dirty -- lock-free, no build */
+            got = cap ? kd_range_locked(h, blo, bhi, ids, cap) : 0;
+        } else {
             int wr = kd_query_lock(h);
             got = cap ? kd_range_locked(h, blo, bhi, ids, cap) : 0;
             kd_query_unlock(h, wr);
@@ -286,7 +314,9 @@ radius(self, coords, r)
         KdRes *res = NULL;
         uint64_t got = 0, i, cap = h->capacity;
         if (cap) { Newx(res, (size_t)cap, KdRes); SAVEFREEPV(res); }   /* alloc BEFORE the lock */
-        {
+        if (h->readonly) {   /* frozen: never dirty -- lock-free, no build */
+            got = cap ? kd_radius_locked(h, buf, r, res, cap) : 0;
+        } else {
             int wr = kd_query_lock(h);
             got = cap ? kd_radius_locked(h, buf, r, res, cap) : 0;
             kd_query_unlock(h, wr);
@@ -307,10 +337,42 @@ clear(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::KDTree::Shared->clear: tree is frozen (read-only)");
     kd_rwlock_wrlock(h);
+    if (h->hdr->sealed) { kd_rwlock_wrunlock(h); croak("Data::KDTree::Shared->clear: tree is frozen (read-only)"); }
     kd_clear_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     kd_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::KDTree::Shared->freeze: cannot freeze a read-only handle");
+    if (kd_freeze(h) != 0) croak("Data::KDTree::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 UV
 count(self)
@@ -319,9 +381,13 @@ count(self)
     EXTRACT(self);
     UV n;
   CODE:
-    kd_rwlock_rdlock(h);
-    n = (UV)h->hdr->count;
-    kd_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable, no lock needed */
+        n = (UV)h->hdr->count;
+    } else {
+        kd_rwlock_rdlock(h);
+        n = (UV)h->hdr->count;
+        kd_rwlock_rdunlock(h);
+    }
     RETVAL = n;
   OUTPUT:
     RETVAL
@@ -355,13 +421,15 @@ stats(self)
     {
         uint64_t count, ops;
         uint32_t dims, cap, dirty;
-        kd_rwlock_rdlock(h);
+        /* Snapshot under the lock; do all (croak-capable) Perl allocation after
+           releasing it -- so an OOM in newHV/newSVuv can never strand the lock. */
+        if (!h->readonly) kd_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         count = h->hdr->count;
         dims  = h->hdr->dims;
         cap   = h->hdr->capacity;
         dirty = h->hdr->dirty;
         ops   = h->hdr->stat_ops;
-        kd_rwlock_rdunlock(h);
+        if (!h->readonly) kd_rwlock_rdunlock(h);
         HV *hv = newHV();
         hv_stores(hv, "count",     newSVuv((UV)count));
         hv_stores(hv, "dims",      newSVuv((UV)dims));
@@ -369,6 +437,8 @@ stats(self)
         hv_stores(hv, "dirty",     newSVuv((UV)dirty));
         hv_stores(hv, "ops",       newSVuv((UV)ops));
         hv_stores(hv, "mmap_size", newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "frozen",    newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",  newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
@@ -400,7 +470,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (kd_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && kd_msync(h) != 0) croak("sync: %s", strerror(errno));
 
 void
 unlink(self, ...)

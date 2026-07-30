@@ -102,7 +102,8 @@ struct KdHeader {
     uint32_t drain_seq;               /* 80  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint32_t slotless_rdepth;         /* readers holding with no reader-slot (documented residual) */
     uint64_t stat_ops;                /* 88 */
-    uint8_t  _pad[160];               /* 96..255 */
+    uint8_t  sealed;                  /* 96  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad[159];               /* 97..255 */
 };
 typedef struct KdHeader KdHeader;
 
@@ -130,6 +131,7 @@ typedef struct KdHandle {
     uint32_t      cached_pid;    /* getpid() cached at last slot claim */
     uint32_t      cached_fork_gen; /* kd_fork_gen value at last slot claim */
     uint32_t slotless_held; /* rwlock read-locks held with no reader-slot */
+    int      readonly;      /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } KdHandle;
 
 /* ================================================================
@@ -685,6 +687,10 @@ static KdHandle *kd_create(const char *path, uint64_t dims, uint64_t capacity, m
             if (!kd_validate_header((KdHeader *)base, (uint64_t)st.st_size)) {
                 KD_ERR("invalid k-d tree file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((KdHeader *)base)->sealed) {
+                KD_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return kd_setup(base, map_size, path, -1);
         }
@@ -721,9 +727,45 @@ static KdHandle *kd_open_fd(int fd, char *errbuf) {
     if (!kd_validate_header((KdHeader *)base, (uint64_t)st.st_size)) {
         KD_ERR("invalid k-d tree table"); munmap(base, ms); return NULL;
     }
+    if (((KdHeader *)base)->sealed) {
+        KD_ERR("this k-d tree is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { KD_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return kd_setup(base, ms, NULL, myfd);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * A sealed tree's points, links and structure are immutable (freeze force-
+ * completes any pending build before publishing the seal -- see kd_freeze), so
+ * nearest/knn/range/radius/count read directly with no reader-slot / rwlock
+ * traffic and never rebuild -- the mapping is never written, so it works from a
+ * read-only fd / read-only filesystem and can be shared PROT_READ across
+ * processes (same architecture; the native magic rejects a wrong-endian file at
+ * validation). */
+static KdHandle *kd_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { KD_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { KD_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(KdHeader)) { KD_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { KD_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!kd_validate_header((KdHeader *)base, (uint64_t)st.st_size)) {
+        KD_ERR("%s: invalid k-d tree file", path); munmap(base, ms); return NULL;
+    }
+    if (!((KdHeader *)base)->sealed) {
+        KD_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    KdHandle *h = kd_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { KD_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
 }
 
 static void kd_destroy(KdHandle *h) {
@@ -751,6 +793,27 @@ static void kd_destroy(KdHandle *h) {
 static inline int kd_msync(KdHandle *h) {
     if (!h || !h->base) return 0;
     return msync(h->base, h->mmap_size, MS_SYNC);
+}
+
+/* forward decl: kd_freeze (below) must force a pending build to completion
+ * before sealing; kd_build_locked itself is defined further down, alongside
+ * the rest of the tree operations. */
+static void kd_build_locked(KdHandle *h);
+
+/* Seal a tree: make it permanently immutable so it can be shipped and opened
+ * read-only.  Takes the write lock and, if a build is pending (dirty), force-
+ * completes it right there -- a sealed tree must NEVER be left dirty, because
+ * the read-only query path (kd_open_readonly handles) takes no lock and never
+ * builds; publishing the seal is what makes that lock-free path safe.  Then
+ * flushes it (file/memfd-backed).  Afterwards every mutator croaks and a
+ * read-write reopen is refused. */
+static int kd_freeze(KdHandle *h) {
+    kd_rwlock_wrlock(h);
+    if (h->hdr->dirty) kd_build_locked(h);
+    h->hdr->sealed = 1;
+    kd_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return kd_msync(h);
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 /* ================================================================
