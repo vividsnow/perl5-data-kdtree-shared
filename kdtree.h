@@ -685,6 +685,23 @@ static KdHandle *kd_create(const char *path, uint64_t dims, uint64_t capacity, m
         if (base == MAP_FAILED) { KD_ERR("mmap: %s", strerror(errno)); flock(fd, LOCK_UN); close(fd); return NULL; }
         if (!is_new) {
             if (!kd_validate_header((KdHeader *)base, (uint64_t)st.st_size)) {
+                /* Recover an abandoned mid-init file: a creator killed between the
+                 * ftruncate and kd_init_header below leaves a full-size, all-zero
+                 * (magic==0) file that would otherwise brick every future open of
+                 * this path.  Re-initialize it, but ONLY when it is exactly our
+                 * size, still uninitialized (magic==0), and owned by us -- a valid
+                 * or foreign file fails this and still errors, never clobbered. */
+                if (((KdHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
+                    && st.st_uid == geteuid()) {
+                    if (fchmod(fd, mode) < 0) {
+                        KD_ERR("%s: fchmod: %s", path, strerror(errno));
+                        munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+                    }
+                    memset(base, 0, map_size);   /* start from a provably empty tree */
+                    kd_init_header(base, (uint32_t)dims, (uint32_t)capacity, total);
+                    flock(fd, LOCK_UN); close(fd);
+                    return kd_setup(base, map_size, path, -1);
+                }
                 KD_ERR("invalid k-d tree file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
             if (((KdHeader *)base)->sealed) {
