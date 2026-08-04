@@ -102,7 +102,7 @@ new(class, path = &PL_sv_undef, dims = 2, capacity = 0, ...)
      * get-magic above can run Perl code that reallocs/frees path's PV. */
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     KdHandle *h = kd_create(p, (uint64_t)dims, (uint64_t)capacity, mode, errbuf);
-    if (!h) croak("Data::KDTree::Shared->new: %s", errbuf);
+    if (!h) croak("Data::KDTree::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -120,7 +120,7 @@ new_memfd(class, name = &PL_sv_undef, dims = 2, capacity = 0)
     if (capacity < 1)
         croak("Data::KDTree::Shared->new_memfd: capacity must be >= 1");
     KdHandle *h = kd_create_memfd(nm, (uint64_t)dims, (uint64_t)capacity, errbuf);
-    if (!h) croak("Data::KDTree::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::KDTree::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -133,7 +133,7 @@ new_from_fd(class, fd)
     char errbuf[KD_ERR_BUFLEN];
   CODE:
     KdHandle *h = kd_open_fd(fd, errbuf);
-    if (!h) croak("Data::KDTree::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::KDTree::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
