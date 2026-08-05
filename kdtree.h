@@ -711,7 +711,6 @@ static KdHandle *kd_create(const char *path, uint64_t dims, uint64_t capacity, m
                         KD_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty tree */
                     kd_init_header(base, (uint32_t)dims, (uint32_t)capacity, total);
                     flock(fd, LOCK_UN); close(fd);
                     return kd_setup(base, map_size, path, -1);
