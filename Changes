@@ -1,8 +1,16 @@
 Revision history for Data-KDTree-Shared
 
-0.01      2026-07-22
+0.02      2026-08-05
+          - xt/valgrind.t: run the real interpreter, not a wrapper script. Under
+            a shim perl (plenv, perlbrew) valgrind traced the shell and never saw
+            the XS, so the test passed regardless of what the module did.
+          - An interrupted create no longer leaves a file that can never be opened
+            again: such a file is re-initialized when it is provably empty and owned
+            by us, and is otherwise reported as incomplete rather than just invalid.
           - Add a frozen read-only mode: freeze() seals a file-backed k-d tree
             immutable; new_readonly() opens it O_RDONLY / PROT_READ and queries
             it lock-free.
+
+0.01      2026-07-22
           - Initial release.
 

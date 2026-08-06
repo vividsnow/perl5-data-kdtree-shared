@@ -1,7 +1,7 @@
 package Data::KDTree::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 require XSLoader;
 XSLoader::load('Data::KDTree::Shared', $VERSION);
 
@@ -69,13 +69,15 @@ C<capacity * 4> bytes and a fixed header.
     my $kd = Data::KDTree::Shared->new_from_fd($fd);
     my $kd = Data::KDTree::Shared->new_readonly($path);   # frozen file, lock-free
 
-C<$dims> is the number of dimensions (1..16) and C<$capacity> the maximum number
-of points (1..2^24). C<new> and C<new_memfd> croak on an out-of-range C<$dims> or
-C<$capacity>. When reopening an existing file or memfd the stored geometry wins
-and the caller's arguments are ignored. An optional file B<mode> may be passed as
-the last argument to C<new> (e.g. C<0660>) for cross-user sharing; it defaults to
-C<0600> (owner-only). A read-write reopen of a B<frozen> file is refused; use
-C<new_readonly> instead (see L</"FROZEN (READ-ONLY) MODE">).
+C<$dims> is the number of dimensions (1..16) and C<$capacity> the maximum
+number of points (1..2^24). C<new> and C<new_memfd> croak on an out-of-range
+C<$dims> or C<$capacity>. When reopening an existing file or memfd the stored
+geometry wins and the caller's arguments do not resize it -- but they are
+still range-checked, so an out-of-range value croaks. An optional file B<mode>
+may be passed as the last argument to C<new> (e.g. C<0660>) for cross-user
+sharing; it defaults to C<0600> (owner-only). A read-write reopen of a
+B<frozen> file is refused; use C<new_readonly> instead (see L</"FROZEN
+(READ-ONLY) MODE">).
 
 =head2 Adding points
 
@@ -166,11 +168,13 @@ filesystem: the lock is a Linux futex (process-local to one kernel), and the
 =head1 SHARING ACROSS PROCESSES
 
 The index lives in a shared mapping, shared the same three ways as the rest of
-the family: a B<backing file>, an B<anonymous mapping inherited across C<fork>>,
-or a B<memfd> passed to an unrelated process and reopened with
-C<< new_from_fd($fd) >>. Any process can add points; the first query after an add
-rebuilds the shared tree once (under the write lock), and subsequent queries run
-concurrently under the read lock.
+the family: a B<backing file>, an B<anonymous mapping inherited across
+C<fork>>, or a B<memfd> passed to an unrelated process and reopened with C<<
+new_from_fd($fd) >>. The descriptor you pass is duplicated
+(C<F_DUPFD_CLOEXEC>), so it stays yours to close and closing it does not
+disturb the handle. Any process can add points; the first query after an add
+rebuilds the shared tree once (under the write lock), and subsequent queries
+run concurrently under the read lock.
 
 =head1 SECURITY
 
@@ -199,6 +203,18 @@ reclaim it and writers may block until the mapping is recreated. Reaching this
 needs more than 1024 concurrent reader processes on one mapping plus a crash in
 the brief read-lock window; the dead-process slot reclaim keeps the table from
 filling with stale entries, so in practice it is very unlikely.
+
+An interrupted create is recovered too. A creator killed after the backing
+file is sized but before its header is committed leaves a full-size, all-zero
+file. C<new> re-initializes such a file automatically, but only when it is
+exactly the size the requested geometry needs, is owned by your effective uid,
+and is still entirely zero -- a file holding data is never re-initialized. If
+the creator got as far as writing part of the header, the file cannot be told
+apart from a corrupt one and C<new> croaks with C<incomplete k-d tree file
+left by an interrupted create; remove it and retry>. A file left behind by an
+interrupted create never held data, so removing it is safe -- but a file whose
+header was corrupted after the fact reaches the same croak, so confirm it is
+an abandoned create before deleting anything you care about.
 
 =head1 SEE ALSO
 
